@@ -1,0 +1,115 @@
+# Production stack: Caddy (TLS) -> API -> Postgres / Redis / Python counts.
+#
+# Usage on the server:
+#   cp .env.example .env   # fill in values
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Only Caddy is exposed publicly (80/443). Adminer is bound to localhost;
+# reach it via an SSH tunnel: ssh -L 8080:localhost:8080 <server>
+
+name: sci
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./caddy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging: &logging
+      driver: json-file
+      options:
+        max-file: '5'
+        max-size: '50m'
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      python-counts:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      DB_HOST: postgres:5432
+      DB: ${POSTGRES_DB:-sci}
+      DB_USERNAME: ${POSTGRES_USER:-admin}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      REDIS_URL: redis://redis:6379
+      PYTHON_API: http://python-counts:8080
+      DFU_DIR: /app/dfu
+      APN_TOPIC: ${APN_TOPIC:-com.appademin.sci-movement}
+      API_KEY: ${API_KEY:?set API_KEY in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - dfu-data:/app/dfu
+    logging: *logging
+
+  python-counts:
+    build: ./api/python
+    restart: unless-stopped
+    # Serve with gunicorn instead of Flask's debug dev server.
+    entrypoint: []
+    command:
+      [
+        'sh',
+        '-c',
+        'pip install --no-cache-dir -q gunicorn==22.0.0 && exec gunicorn -b 0.0.0.0:8080 -w 2 --timeout 120 main:app',
+      ]
+    environment:
+      PYTHONPATH: /app
+    logging: *logging
+
+  postgres:
+    build: ./postgres
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sci}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  redis:
+    image: redis:7.0.0
+    restart: unless-stopped
+    # Matches the k8s deployment: cache only, no persistence.
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    logging: *logging
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - '127.0.0.1:8080:8080'
+    logging: *logging
+
+volumes:
+  pg-data:
+  dfu-data:
+  caddy-data:
+  caddy-config:
